@@ -6,27 +6,14 @@ import csv
 import re
 import threading
 import json
+import math
 import gi
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Gio, GLib, Gdk, Adw
-
-import matplotlib
-# Use GTK4Agg for interactive plots
-try:
-    matplotlib.use('GTK4Agg')
-except ImportError:
-    # Fallback if somehow still missing, though we expect it to work
-    print("Warning: GTK4Agg backend not found, falling back to Agg (non-interactive)")
-    matplotlib.use('Agg')
-
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator, FuncFormatter
-from matplotlib.backends.backend_gtk4agg import FigureCanvasGTK4Agg
-from matplotlib.backends.backend_gtk4 import NavigationToolbar2GTK4
-from matplotlib.backend_bases import MouseButton
-from collections import namedtuple
+gi.require_version('Pango', '1.0')
+gi.require_version('PangoCairo', '1.0')
+from gi.repository import Gtk, Gio, GLib, Gdk, Adw, Pango, PangoCairo
 
 # --- Config Logic ---
 CONFIG_FILE = os.path.expanduser("~/.config/ass-profiler/config.json")
@@ -36,8 +23,8 @@ def load_config():
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 return json.load(f)
-    except Exception as e:
-        print(f"Error loading config: {e}")
+    except Exception:
+        pass
     return {}
 
 def save_config(config):
@@ -45,220 +32,268 @@ def save_config(config):
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f)
-    except Exception as e:
-        print(f"Error saving config: {e}")
+    except Exception:
+        pass
 
-# --- Graph Logic ---
-
+# --- Data Structures ---
 frame_stat_names = ['time','total_image_size', 'largest_image_size','image_count','time_benchmark']
+from collections import namedtuple
 Frame_Statistics = namedtuple('Frame_Statistics', frame_stat_names)
-frame_graph_labels = [
-    'total bitmap sizes for frame',
-    'largest bitmap size in frame',
-    'bitmap counts',
-    'frame render time',
-]
-frame_stat_y_axis_labels = [
-    'bytes',
-    'bytes',
-    'counts',
-    'milliseconds',
-]
 
-def sec_to_mm_ss_str(sec):
-    rs = round(sec, 2)
-    s = '{0:02.0f}'.format(rs%60)
-    return f"{int(rs / 60):02d}:{s}"
-
+# --- Helper Functions ---
 def str2s(hmrstr):
-    mre = re.match("([0-9]+):([0-9]{2}):([0-9.]+)",hmrstr)
+    mre = re.match("([0-9]+):([0-9]{2}):([0-9.]+)", hmrstr)
     if not mre: return 0
-    h = int(mre[1])
-    m = int(mre[2])
-    s = float(mre[3])
-    return ((h*60) + m ) * 60 + s
+    h, m, s = int(mre[1]), int(mre[2]), float(mre[3])
+    return (h * 3600) + (m * 60) + s
 
-def Base10BytesFormatter(max_y):
-    if max_y > 1000**3:
-        return lambda y,pos: f"{'{:.1f}'.format(y/1000**3)} GB"
-    elif max_y > 1000**2:
-        return lambda y,pos: f"{'{:.1f}'.format(y/1000**2)} MB"
-    elif max_y > 1000:
-        return lambda y,pos: f"{'{:.1f}'.format(y/1000)} kB"
-    else:
-        return lambda y,pos: f"{int(y)}"
+def format_time(sec):
+    sec = max(0, sec)
+    m = int(sec // 60)
+    s = int(sec % 60)
+    return f"{m:02d}:{s:02d}"
 
-def get_theme_colors():
-    """
-    Returns theme colors based on Adwaita style preference.
-    """
-    manager = Adw.StyleManager.get_default()
-    is_dark = manager.get_dark()
-    
-    if is_dark:
-        return {
-            'bg': '#242424', # Adwaita Dark BG
-            'fg': '#ffffff', # Adwaita Dark FG
-            'grid': '#ffffff',
-        }
-    else:
-        return {
-            'bg': '#fafafa', # Adwaita Light BG
-            'fg': '#000000', # Adwaita Light FG
-            'grid': '#000000',
-        }
+def format_bytes(n):
+    n = max(0, n)
+    if n >= 10**9: return f"{n/10**9:.1f} GB"
+    if n >= 10**6: return f"{n/10**6:.1f} MB"
+    if n >= 10**3: return f"{n/10**3:.1f} kB"
+    return f"{int(n)} B"
 
+# --- Native GTK4 Graph Widget ---
 
-def create_interactive_figure(samples, title, colors, fps=23.976):
-    zs = list(zip(*samples))
-    time_domain = [str2s(t) for t in zs[0]]
-    datasets = zs[1:]
-
-    bg_color = colors['bg']
-    text_color = colors['fg']
-    grid_color = colors['fg']
-
-    plt.rcParams.update({
-        'figure.facecolor': bg_color,
-        'axes.facecolor': bg_color,
-        'axes.edgecolor': text_color,
-        'axes.labelcolor': text_color,
-        'xtick.color': text_color,
-        'ytick.color': text_color,
-        'grid.color': grid_color,
-        'grid.alpha': 0.2,
-        'text.color': text_color,
-        'axes.titlecolor': text_color,
-        'path.simplify': True,
-        'path.simplify_threshold': 1.0,
-        'agg.path.chunksize': 10000,
-    })
-
-    fig, subplots = plt.subplots(len(datasets), 1, figsize=(10, 8))
-    
-    safe_title = re.sub(r".*[/\\]", "", title)
-    fig.suptitle(f'Analytics for {safe_title}')
-
-    for subplot, dataset, graph_label, y_label in zip(subplots, datasets, frame_graph_labels, frame_stat_y_axis_labels):
-        float_data = [float(a) for a in dataset]
-        max_y = max(float_data) if float_data else 0
-        subplot.ticklabel_format(style='plain')
-        subplot.xaxis.set_major_locator(MultipleLocator(60))
-        subplot.xaxis.set_minor_locator(MultipleLocator(15))
-        subplot.xaxis.set_major_formatter(FuncFormatter(lambda x,pos: sec_to_mm_ss_str(x)))
-        subplot.grid(visible=True, which='major', axis='x')
+class ProfilerGraph(Gtk.DrawingArea):
+    def __init__(self, data_points, title, y_label_type='count'):
+        super().__init__()
+        self.data = data_points 
+        self.title = title
+        self.y_label_type = y_label_type 
         
-        if y_label == "bytes":
-            subplot.yaxis.set_major_formatter(Base10BytesFormatter(max_y))
+        # View State
+        if data_points:
+            self.min_x = 0
+            self.max_x = max(p[0] for p in data_points)
+            self.min_y = 0
+            raw_max_y = max(p[1] for p in data_points) if data_points else 1
+            self.max_y = 60 if y_label_type == 'ms' else raw_max_y * 1.2
         else:
-            subplot.set(xlabel=None, ylabel=y_label)
+            self.min_x, self.max_x, self.min_y, self.max_y = 0, 100, 0, 100
+
+        self.set_draw_func(self.on_draw)
+        
+        # Interaction Controllers
+        scroll_controller = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll_controller.connect("scroll", self.on_scroll)
+        self.add_controller(scroll_controller)
+        
+        drag_controller = Gtk.GestureDrag.new()
+        drag_controller.connect("drag-begin", self.on_drag_begin)
+        drag_controller.connect("drag-update", self.on_drag_update)
+        self.add_controller(drag_controller)
+
+    def on_draw(self, area, cr, width, height):
+        # Dynamically fetch theme colors from Adwaita Style Manager
+        style_manager = Adw.StyleManager.get_default()
+        is_dark = style_manager.get_dark()
+        
+        if is_dark:
+            # Official Adwaita Dark Palette
+            bg_color = (0.141, 0.141, 0.141)    # window_bg_color
+            grid_color = (0.22, 0.22, 0.22)     # Subtle grid
+            text_color = (1.0, 1.0, 1.0)        # window_fg_color
+            line_color = (0.21, 0.52, 0.89)     # accent_bg_color (blue)
+            limit_color = (0.75, 0.15, 0.15)    # error_bg_color (red)
+        else:
+            # Official Adwaita Light Palette
+            bg_color = (1.0, 1.0, 1.0)          # window_bg_color
+            grid_color = (0.92, 0.92, 0.92)     # Subtle grid
+            text_color = (0.0, 0.0, 0.0)        # window_fg_color
+            line_color = (0.11, 0.44, 0.82)     # accent_bg_color
+            limit_color = (0.75, 0.15, 0.15)    # error_bg_color
+
+        # Clear Background
+        cr.set_source_rgb(*bg_color)
+        cr.paint()
+
+        padding_l, padding_r, padding_t, padding_b = 75, 20, 45, 45
+        graph_w = width - padding_l - padding_r
+        graph_h = height - padding_t - padding_b
+
+        if graph_w <= 0 or graph_h <= 0 or not self.data:
+            return
+
+        # Clamp view range (Never show negative)
+        self.min_x = max(0, self.min_x)
+        self.min_y = max(0, self.min_y)
+        if self.max_x <= self.min_x: self.max_x = self.min_x + 1
+        if self.max_y <= self.min_y: self.max_y = self.min_y + 1
+
+        # Coordinate Mappers
+        def to_screen(x, y):
+            sx = padding_l + ((x - self.min_x) / (self.max_x - self.min_x)) * graph_w
+            sy = padding_t + (1 - (y - self.min_y) / (self.max_y - self.min_y)) * graph_h
+            return sx, sy
+
+        # Draw Grid & Labels
+        cr.set_line_width(1.0)
+        
+        # Y Axis Ticks
+        steps = 5
+        for i in range(steps + 1):
+            y_val = self.min_y + (self.max_y - self.min_y) * (i / steps)
+            sx, sy = to_screen(self.min_x, y_val)
             
-        if graph_label == "frame render time":
-            calc_fps = fps if fps > 0 else 23.976
-            subplot.axhline(y = 1000 / calc_fps, color='r', linestyle = 'dashed')
-            subplot.axhline(y = (1000 / calc_fps) / 2, color='w', linestyle = 'dashed')
-            subplot.set_ylim([0, 60])
-        else:
-            subplot.set_ylim([0, max_y * 1.1 if max_y > 0 else 1]) 
-        
-        if time_domain:
-            subplot.set_xlim([time_domain[0], time_domain[-1]])
-        
-        subplot.plot(time_domain, float_data, linewidth=1)
-        subplot.set_title(graph_label)
-    
-    fig.tight_layout()
-    return fig
+            cr.set_source_rgb(*grid_color)
+            cr.move_to(padding_l, sy)
+            cr.line_to(width - padding_r, sy)
+            cr.stroke()
+            
+            # Y Label
+            label_text = ""
+            if self.y_label_type == 'bytes': label_text = format_bytes(y_val)
+            elif self.y_label_type == 'ms': label_text = f"{int(y_val)}ms"
+            else: label_text = str(int(y_val))
+            
+            self.draw_text(cr, label_text, padding_l - 10, sy, text_color, align='right')
 
-# --- GTK4 Application ---
+        # X Axis Ticks (Every 60s)
+        start_tick = math.floor(self.min_x / 60) * 60
+        tick = start_tick
+        while tick <= self.max_x:
+            sx, sy = to_screen(tick, self.min_y)
+            if sx >= padding_l:
+                cr.set_source_rgb(*grid_color)
+                cr.move_to(sx, padding_t)
+                cr.line_to(sx, height - padding_b)
+                cr.stroke()
+                self.draw_text(cr, format_time(tick), sx, height - padding_b + 5, text_color, align='center')
+            tick += 60
+
+        # Draw Title
+        self.draw_text(cr, self.title, width / 2, 15, text_color, align='center', bold=True)
+
+        # Clipping for Data
+        cr.save()
+        cr.rectangle(padding_l, padding_t, graph_w, graph_h)
+        cr.clip()
+
+        # Draw Benchmark lines for ms graph
+        if self.y_label_type == 'ms':
+            # 24fps limit (~41.6ms)
+            _, sy_limit = to_screen(self.min_x, 1000/23.976)
+            cr.set_source_rgb(*limit_color)
+            cr.set_dash([4.0, 4.0])
+            cr.move_to(padding_l, sy_limit)
+            cr.line_to(width-padding_r, sy_limit)
+            cr.stroke()
+            cr.set_dash([])
+
+        # Draw Data Line
+        cr.set_source_rgb(*line_color)
+        cr.set_line_width(1.8)
+        first = True
+        
+        for x, y in self.data:
+            if x < self.min_x - (self.max_x - self.min_x): continue
+            if x > self.max_x + (self.max_x - self.min_x): break
+            
+            sx, sy = to_screen(x, y)
+            if first:
+                cr.move_to(sx, sy)
+                first = False
+            else:
+                cr.line_to(sx, sy)
+        cr.stroke()
+        cr.restore()
+
+    def draw_text(self, cr, text, x, y, color, align='left', bold=False):
+        layout = self.create_pango_layout(text)
+        desc = Pango.FontDescription.from_string("Sans 9")
+        if bold: desc.set_weight(Pango.Weight.BOLD)
+        layout.set_font_description(desc)
+        
+        cr.set_source_rgb(*color)
+        logical_rect = layout.get_pixel_extents()[1]
+        
+        tx, ty = x, y
+        if align == 'center': tx -= logical_rect.width / 2
+        elif align == 'right': tx -= logical_rect.width
+        
+        cr.move_to(tx, ty - logical_rect.height / 2 if align != 'center' else ty)
+        PangoCairo.show_layout(cr, layout)
+
+    def on_scroll(self, controller, dx, dy):
+        state = controller.get_current_event().get_modifier_state()
+        zoom_factor = 1.15
+        pan_factor = 0.1
+        range_x = self.max_x - self.min_x
+        
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            # Zoom X (centered)
+            scale = zoom_factor if dy > 0 else (1/zoom_factor)
+            new_range = range_x * scale
+            mid_x = (self.min_x + self.max_x) / 2
+            self.min_x = max(0, mid_x - new_range / 2)
+            self.max_x = self.min_x + new_range
+        elif state & Gdk.ModifierType.SHIFT_MASK:
+            # Zoom Y: Lock bottom at 0, only scale the top
+            scale = zoom_factor if dy > 0 else (1/zoom_factor)
+            self.max_y = max(0.01, self.max_y * scale)
+            self.min_y = 0
+        else:
+            # Pan X
+            shift = range_x * pan_factor * (1 if dy > 0 else -1)
+            self.min_x = max(0, self.min_x + shift)
+            self.max_x = self.min_x + range_x
+            
+        self.queue_draw()
+
+    def on_drag_begin(self, gesture, start_x, start_y):
+        self.drag_start_min_x = self.min_x
+        self.drag_start_max_x = self.max_x
+        self.drag_start_min_y = self.min_y
+        self.drag_start_max_y = self.max_y
+
+    def on_drag_update(self, gesture, offset_x, offset_y):
+        width = self.get_width() - 95
+        height = self.get_height() - 90
+        if width <= 0 or height <= 0: return
+        
+        range_x = self.drag_start_max_x - self.drag_start_min_x
+        range_y = self.drag_start_max_y - self.drag_start_min_y
+        
+        dx = -(offset_x / width) * range_x
+        dy = (offset_y / height) * range_y
+        
+        self.min_x = max(0, self.drag_start_min_x + dx)
+        self.max_x = self.min_x + range_x
+        
+        self.min_y = max(0, self.drag_start_min_y + dy)
+        self.max_y = self.min_y + range_y
+        self.queue_draw()
+
+# --- Application Windows ---
 
 class GraphWindow(Gtk.Window):
-    def __init__(self, figure, title):
-        super().__init__(title=title)
-        self.set_default_size(1000, 800)
+    def __init__(self, data_list, title):
+        super().__init__(title=f"Analytics - {title}")
+        self.set_default_size(950, 850)
         
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_child(box)
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_child(main_box)
         
-        self.canvas = FigureCanvasGTK4Agg(figure)
-        self.canvas.set_vexpand(True)
-        self.canvas.set_hexpand(True)
-        box.append(self.canvas)
+        times = [str2s(d.time) for d in data_list]
+        series = [
+            (list(zip(times, [float(d.total_image_size) for d in data_list])), 'Total Bitmap Size', 'bytes'),
+            (list(zip(times, [float(d.largest_image_size) for d in data_list])), 'Largest Bitmap Size', 'bytes'),
+            (list(zip(times, [float(d.image_count) for d in data_list])), 'Bitmap Counts', 'count'),
+            (list(zip(times, [float(d.time_benchmark) * 1000 for d in data_list])), 'Frame Render Time', 'ms')
+        ]
         
-        # Connect Scroll Event
-        self.canvas.mpl_connect('scroll_event', self.on_scroll)
-        
-        self.toolbar = NavigationToolbar2GTK4(self.canvas)
-        box.append(self.toolbar)
-
-    def on_scroll(self, event):
-        ax = event.inaxes
-        if ax is None: return
-
-        # Constants (Increased for "faster" feel)
-        zoom_base = 1.25
-        pan_amount = 0.15 
-
-        # Check modifiers
-        # Matplotlib 'key' attribute contains the key pressed during event
-        # 'control' for Ctrl, 'shift' for Shift.
-        
-        cur_xlim = ax.get_xlim()
-        cur_ylim = ax.get_ylim()
-        
-        xdata = event.xdata
-        ydata = event.ydata
-        
-        if event.key == 'control':
-            # ZOOM X
-            if event.button == 'up': # Zoom In
-                scale = 1 / zoom_base
-            else: # Zoom Out
-                scale = zoom_base
-            
-            # Zoom centered on cursor X
-            new_width = (cur_xlim[1] - cur_xlim[0]) * scale
-            rel_x = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
-            new_x1 = xdata - new_width * (1 - rel_x)
-            new_x2 = xdata + new_width * rel_x
-            ax.set_xlim([new_x1, new_x2])
-
-        elif event.key == 'shift':
-            # ZOOM Y
-            if event.button == 'up': # Zoom In
-                scale = 1 / zoom_base
-            else:
-                scale = zoom_base
-            
-            new_height = (cur_ylim[1] - cur_ylim[0]) * scale
-            rel_y = (cur_ylim[1] - ydata) / (cur_ylim[1] - cur_ylim[0])
-            new_y1 = ydata - new_height * (1 - rel_y)
-            new_y2 = ydata + new_height * rel_y
-            ax.set_ylim([new_y1, new_y2])
-
-        else:
-            # PAN X
-            # Move along X axis
-            # Button up: Scroll Left (move view left -> subtract) ? 
-            # Typically Scroll Up -> Pan Right? Or Scroll Up -> Move Left?
-            # Standard conventions vary. Let's assume Scroll Up = Move Left (Time back)
-            
-            width = cur_xlim[1] - cur_xlim[0]
-            step = width * pan_amount
-            
-            if event.button == 'up':
-                # Move left (back in time)
-                new_x1 = cur_xlim[0] - step
-                new_x2 = cur_xlim[1] - step
-            else:
-                # Move right (forward in time)
-                new_x1 = cur_xlim[0] + step
-                new_x2 = cur_xlim[1] + step
-                
-            ax.set_xlim([new_x1, new_x2])
-
-        event.canvas.draw_idle()
-
+        for data, label, ltype in series:
+            graph = ProfilerGraph(data, label, ltype)
+            graph.set_vexpand(True)
+            main_box.append(graph)
 
 class AssProfilerWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
@@ -267,10 +302,8 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
         self.set_default_size(400, 200)
 
         self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.box.set_margin_top(24)
-        self.box.set_margin_bottom(24)
-        self.box.set_margin_start(24)
-        self.box.set_margin_end(24)
+        for m in ['top', 'bottom', 'start', 'end']:
+            getattr(self.box, f"set_margin_{m}")(24)
         self.set_child(self.box)
 
         self.label = Gtk.Label(label="Select an .ass file to profile")
@@ -292,15 +325,12 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
 
     def on_select_file(self, button):
         dialog = Gtk.FileDialog(title="Open .ass File")
-        
         config = load_config()
         last_dir = config.get("last_directory")
         if last_dir and os.path.exists(last_dir):
             try:
-                folder = Gio.File.new_for_path(last_dir)
-                dialog.set_initial_folder(folder)
-            except Exception as e:
-                print(f"Failed to set initial folder: {e}")
+                dialog.set_initial_folder(Gio.File.new_for_path(last_dir))
+            except Exception: pass
 
         filter_ass = Gtk.FileFilter()
         filter_ass.set_name("ASS Files")
@@ -318,98 +348,53 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
                 config = load_config()
                 config["last_directory"] = os.path.dirname(filepath)
                 save_config(config)
-                
                 self.process_file(filepath)
-        except Exception:
-            pass
+        except Exception: pass
 
     def process_file(self, filepath):
         self.status_label.set_text(f"Processing: {os.path.basename(filepath)}...")
         self.button.set_sensitive(False)
         self.progress.set_visible(True)
         self.progress.set_fraction(0.1)
-        
-        thread = threading.Thread(target=self.run_profiler_thread, args=(filepath,))
-        thread.daemon = True
-        thread.start()
+        threading.Thread(target=self.run_profiler_thread, args=(filepath,), daemon=True).start()
 
     def run_profiler_thread(self, filepath):
-        print(f"Thread started for: {filepath}")
         profiler_exe = "libass_profiler.exe"
         output_csv = "output.csv"
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        exe_path = os.path.join(script_dir, profiler_exe)
-        
-        if not os.path.exists(exe_path):
-            exe_path = os.path.abspath(profiler_exe)
+        exe_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), profiler_exe)
+        if not os.path.exists(exe_path): exe_path = os.path.abspath(profiler_exe)
 
         try:
             abs_filepath = os.path.abspath(filepath)
-            # ... winepath logic ...
-            try:
-                wp = subprocess.run(['winepath', '-w', abs_filepath], capture_output=True, text=True, timeout=5)
-                win_filepath = wp.stdout.strip() if wp.returncode == 0 else abs_filepath
-            except subprocess.TimeoutExpired:
-                win_filepath = abs_filepath
+            wp = subprocess.run(['winepath', '-w', abs_filepath], capture_output=True, text=True, timeout=5)
+            win_filepath = wp.stdout.strip() if wp.returncode == 0 else abs_filepath
 
             abs_out = os.path.abspath(output_csv)
-            try:
-                wp_out = subprocess.run(['winepath', '-w', abs_out], capture_output=True, text=True, timeout=5)
-                win_out = wp_out.stdout.strip() if wp_out.returncode == 0 else output_csv
-            except subprocess.TimeoutExpired:
-                win_out = output_csv
+            wp_out = subprocess.run(['winepath', '-w', abs_out], capture_output=True, text=True, timeout=5)
+            win_out = wp_out.stdout.strip() if wp_out.returncode == 0 else output_csv
 
-            cmd = ['wine', exe_path, win_filepath, win_out]
-            print(f"Executing: {cmd}")
-            
-            GLib.idle_add(self.update_progress, 0.4)
-            
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if proc.returncode != 0:
-                GLib.idle_add(self.show_error, "Profiler failed", proc.stderr)
-                GLib.idle_add(self.reset_ui)
-                return
+            GLib.idle_add(self.update_ui, 0.4, "Executing Wine...")
+            subprocess.run(['wine', exe_path, win_filepath, win_out], capture_output=True)
 
-            GLib.idle_add(self.update_progress, 0.7)
-            GLib.idle_add(self.update_status, "Generating Graph...")
-            
+            GLib.idle_add(self.update_ui, 0.8, "Loading Data...")
             data_list, title = self.load_csv(abs_out)
             
-            # Defer figure creation to main thread to capture theme colors correctly?
-            # OR capture colors here? We can't access widget methods safely from thread.
-            # So we pass data to main thread function.
-            
-            GLib.idle_add(self.show_interactive_graph, data_list, title)
-            GLib.idle_add(self.update_status, "Done.")
-
+            GLib.idle_add(self.show_results, data_list, title)
         except Exception as e:
-            print(f"Exception: {e}")
-            GLib.idle_add(self.show_error, "Error", str(e))
+            GLib.idle_add(self.show_error, str(e))
         
         GLib.idle_add(self.reset_ui)
 
-    def show_interactive_graph(self, data_list, title):
-        try:
-            # Get theme colors
-            colors = get_theme_colors()
-            
-            fig = create_interactive_figure(data_list, title, colors)
-            graph_win = GraphWindow(fig, f"Analytics - {title}")
-            graph_win.set_transient_for(self)
-            graph_win.present()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.show_error("Graph Error", str(e))
-        return False
-
-    def update_progress(self, fraction):
+    def update_ui(self, fraction, status):
         self.progress.set_fraction(fraction)
+        self.status_label.set_text(status)
         return False
 
-    def update_status(self, text):
-        self.status_label.set_text(text)
+    def show_results(self, data_list, title):
+        win = GraphWindow(data_list, title)
+        win.set_transient_for(self)
+        win.present()
+        self.status_label.set_text("Done.")
         return False
 
     def load_csv(self, csv_file):
@@ -417,21 +402,14 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
         with open(csv_file, newline='') as f:
             reader = csv.reader(f)
             title = next(reader)[0]
-            next(reader) 
+            next(reader)
             for row in reader:
                 if len(row) < 5: continue
-                row[4] = float(row[4]) * 1000
                 data_list.append(Frame_Statistics(*row))
         return data_list, title
 
-    def show_error(self, title, msg):
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-            message_type=Gtk.MessageType.ERROR,
-            buttons=Gtk.ButtonsType.OK,
-            text=title
-        )
+    def show_error(self, msg):
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text="Error")
         dialog.props.secondary_text = msg
         dialog.connect("response", lambda d, r: d.destroy())
         dialog.show()
@@ -444,12 +422,9 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
 
 class AssProfilerApp(Adw.Application):
     def __init__(self):
-        super().__init__(application_id="com.example.AssProfiler", flags=Gio.ApplicationFlags.FLAGS_NONE)
-
+        super().__init__(application_id="com.example.AssProfiler")
     def do_activate(self):
-        window = AssProfilerWindow(self)
-        window.present()
+        AssProfilerWindow(self).present()
 
 if __name__ == "__main__":
-    app = AssProfilerApp()
-    app.run(sys.argv)
+    AssProfilerApp().run(sys.argv)
