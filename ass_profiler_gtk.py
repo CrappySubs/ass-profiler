@@ -7,6 +7,8 @@ import re
 import threading
 import json
 import math
+import hashlib
+import shlex
 import gi
 
 gi.require_version('Gtk', '4.0')
@@ -15,8 +17,13 @@ gi.require_version('Pango', '1.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Gtk, Gio, GLib, Gdk, Adw, Pango, PangoCairo
 
-# --- Config Logic ---
-CONFIG_FILE = os.path.expanduser("~/.config/ass-profiler/config.json")
+# --- Config & Cache Paths ---
+CONFIG_DIR = os.path.expanduser("~/.config/ass-profiler")
+CACHE_DIR = os.path.expanduser("~/.cache/ass-profiler")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 def load_config():
     try:
@@ -29,7 +36,6 @@ def load_config():
 
 def save_config(config):
     try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f)
     except Exception:
@@ -92,7 +98,7 @@ class ProfilerGraph(Gtk.DrawingArea):
         self.add_controller(drag_controller)
 
     def on_draw(self, area, cr, width, height):
-        # Dynamically fetch theme colors from Adwaita Style Manager
+        # Dynamically fetch theme colors
         style_manager = Adw.StyleManager.get_default()
         is_dark = style_manager.get_dark()
         
@@ -111,7 +117,6 @@ class ProfilerGraph(Gtk.DrawingArea):
             line_color = (0.11, 0.44, 0.82)     # accent_bg_color
             limit_color = (0.75, 0.15, 0.15)    # error_bg_color
 
-        # Clear Background
         cr.set_source_rgb(*bg_color)
         cr.paint()
 
@@ -122,41 +127,33 @@ class ProfilerGraph(Gtk.DrawingArea):
         if graph_w <= 0 or graph_h <= 0 or not self.data:
             return
 
-        # Clamp view range (Never show negative)
+        # Clamp view range
         self.min_x = max(0, self.min_x)
         self.min_y = max(0, self.min_y)
         if self.max_x <= self.min_x: self.max_x = self.min_x + 1
         if self.max_y <= self.min_y: self.max_y = self.min_y + 1
 
-        # Coordinate Mappers
         def to_screen(x, y):
             sx = padding_l + ((x - self.min_x) / (self.max_x - self.min_x)) * graph_w
             sy = padding_t + (1 - (y - self.min_y) / (self.max_y - self.min_y)) * graph_h
             return sx, sy
 
-        # Draw Grid & Labels
         cr.set_line_width(1.0)
-        
-        # Y Axis Ticks
         steps = 5
         for i in range(steps + 1):
             y_val = self.min_y + (self.max_y - self.min_y) * (i / steps)
             sx, sy = to_screen(self.min_x, y_val)
-            
             cr.set_source_rgb(*grid_color)
             cr.move_to(padding_l, sy)
             cr.line_to(width - padding_r, sy)
             cr.stroke()
             
-            # Y Label
             label_text = ""
             if self.y_label_type == 'bytes': label_text = format_bytes(y_val)
             elif self.y_label_type == 'ms': label_text = f"{int(y_val)}ms"
             else: label_text = str(int(y_val))
-            
             self.draw_text(cr, label_text, padding_l - 10, sy, text_color, align='right')
 
-        # X Axis Ticks (Every 60s)
         start_tick = math.floor(self.min_x / 60) * 60
         tick = start_tick
         while tick <= self.max_x:
@@ -169,17 +166,13 @@ class ProfilerGraph(Gtk.DrawingArea):
                 self.draw_text(cr, format_time(tick), sx, height - padding_b + 5, text_color, align='center')
             tick += 60
 
-        # Draw Title
         self.draw_text(cr, self.title, width / 2, 15, text_color, align='center', bold=True)
 
-        # Clipping for Data
         cr.save()
         cr.rectangle(padding_l, padding_t, graph_w, graph_h)
         cr.clip()
 
-        # Draw Benchmark lines for ms graph
         if self.y_label_type == 'ms':
-            # 24fps limit (~41.6ms)
             _, sy_limit = to_screen(self.min_x, 1000/23.976)
             cr.set_source_rgb(*limit_color)
             cr.set_dash([4.0, 4.0])
@@ -188,15 +181,12 @@ class ProfilerGraph(Gtk.DrawingArea):
             cr.stroke()
             cr.set_dash([])
 
-        # Draw Data Line
         cr.set_source_rgb(*line_color)
         cr.set_line_width(1.8)
         first = True
-        
         for x, y in self.data:
             if x < self.min_x - (self.max_x - self.min_x): continue
             if x > self.max_x + (self.max_x - self.min_x): break
-            
             sx, sy = to_screen(x, y)
             if first:
                 cr.move_to(sx, sy)
@@ -208,44 +198,37 @@ class ProfilerGraph(Gtk.DrawingArea):
 
     def draw_text(self, cr, text, x, y, color, align='left', bold=False):
         layout = self.create_pango_layout(text)
-        desc = Pango.FontDescription.from_string("Sans 9")
+        desc = Pango.FontDescription.from_string("Sans 8")
         if bold: desc.set_weight(Pango.Weight.BOLD)
         layout.set_font_description(desc)
-        
         cr.set_source_rgb(*color)
         logical_rect = layout.get_pixel_extents()[1]
-        
         tx, ty = x, y
         if align == 'center': tx -= logical_rect.width / 2
         elif align == 'right': tx -= logical_rect.width
-        
         cr.move_to(tx, ty - logical_rect.height / 2 if align != 'center' else ty)
         PangoCairo.show_layout(cr, layout)
 
     def on_scroll(self, controller, dx, dy):
         state = controller.get_current_event().get_modifier_state()
         zoom_factor = 1.15
-        pan_factor = 0.1
         range_x = self.max_x - self.min_x
-        
         if state & Gdk.ModifierType.CONTROL_MASK:
-            # Zoom X (centered)
             scale = zoom_factor if dy > 0 else (1/zoom_factor)
             new_range = range_x * scale
             mid_x = (self.min_x + self.max_x) / 2
             self.min_x = max(0, mid_x - new_range / 2)
             self.max_x = self.min_x + new_range
         elif state & Gdk.ModifierType.SHIFT_MASK:
-            # Zoom Y: Lock bottom at 0, only scale the top
+            # Zoom Y: Lock bottom at 0
             scale = zoom_factor if dy > 0 else (1/zoom_factor)
             self.max_y = max(0.01, self.max_y * scale)
             self.min_y = 0
         else:
             # Pan X
-            shift = range_x * pan_factor * (1 if dy > 0 else -1)
+            shift = range_x * 0.1 * (1 if dy > 0 else -1)
             self.min_x = max(0, self.min_x + shift)
             self.max_x = self.min_x + range_x
-            
         self.queue_draw()
 
     def on_drag_begin(self, gesture, start_x, start_y):
@@ -258,18 +241,11 @@ class ProfilerGraph(Gtk.DrawingArea):
         width = self.get_width() - 95
         height = self.get_height() - 90
         if width <= 0 or height <= 0: return
-        
-        range_x = self.drag_start_max_x - self.drag_start_min_x
-        range_y = self.drag_start_max_y - self.drag_start_min_y
-        
-        dx = -(offset_x / width) * range_x
-        dy = (offset_y / height) * range_y
-        
-        self.min_x = max(0, self.drag_start_min_x + dx)
-        self.max_x = self.min_x + range_x
-        
-        self.min_y = max(0, self.drag_start_min_y + dy)
-        self.max_y = self.min_y + range_y
+        rx, ry = self.drag_start_max_x - self.drag_start_min_x, self.drag_start_max_y - self.drag_start_min_y
+        self.min_x = max(0, self.drag_start_min_x - (offset_x / width) * rx)
+        self.max_x = self.min_x + rx
+        self.min_y = max(0, self.drag_start_min_y + (offset_y / height) * ry)
+        self.max_y = self.min_y + ry
         self.queue_draw()
 
 # --- Application Windows ---
@@ -278,10 +254,8 @@ class GraphWindow(Gtk.Window):
     def __init__(self, data_list, title):
         super().__init__(title=f"Analytics - {title}")
         self.set_default_size(950, 850)
-        
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_child(main_box)
-        
         times = [str2s(d.time) for d in data_list]
         series = [
             (list(zip(times, [float(d.total_image_size) for d in data_list])), 'Total Bitmap Size', 'bytes'),
@@ -289,7 +263,6 @@ class GraphWindow(Gtk.Window):
             (list(zip(times, [float(d.image_count) for d in data_list])), 'Bitmap Counts', 'count'),
             (list(zip(times, [float(d.time_benchmark) * 1000 for d in data_list])), 'Frame Render Time', 'ms')
         ]
-        
         for data, label, ltype in series:
             graph = ProfilerGraph(data, label, ltype)
             graph.set_vexpand(True)
@@ -300,25 +273,19 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
         super().__init__(application=app)
         self.set_title("ASS Profiler")
         self.set_default_size(400, 200)
-
         self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        for m in ['top', 'bottom', 'start', 'end']:
-            getattr(self.box, f"set_margin_{m}")(24)
+        for m in ['top', 'bottom', 'start', 'end']: getattr(self.box, f"set_margin_{m}")(24)
         self.set_child(self.box)
-
         self.label = Gtk.Label(label="Select an .ass file to profile")
         self.box.append(self.label)
-
         self.button = Gtk.Button(label="Select File")
         self.button.set_halign(Gtk.Align.CENTER)
         self.button.add_css_class("suggested-action")
         self.button.connect("clicked", self.on_select_file)
         self.box.append(self.button)
-
         self.progress = Gtk.ProgressBar()
         self.progress.set_visible(False)
         self.box.append(self.progress)
-
         self.status_label = Gtk.Label(label="Ready")
         self.status_label.add_css_class("dim-label")
         self.box.append(self.status_label)
@@ -328,10 +295,8 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
         config = load_config()
         last_dir = config.get("last_directory")
         if last_dir and os.path.exists(last_dir):
-            try:
-                dialog.set_initial_folder(Gio.File.new_for_path(last_dir))
+            try: dialog.set_initial_folder(Gio.File.new_for_path(last_dir))
             except Exception: pass
-
         filter_ass = Gtk.FileFilter()
         filter_ass.set_name("ASS Files")
         filter_ass.add_pattern("*.ass")
@@ -349,7 +314,7 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
                 config["last_directory"] = os.path.dirname(filepath)
                 save_config(config)
                 self.process_file(filepath)
-        except Exception: pass
+        except GLib.Error: pass # Cancelled
 
     def process_file(self, filepath):
         self.status_label.set_text(f"Processing: {os.path.basename(filepath)}...")
@@ -359,26 +324,67 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
         threading.Thread(target=self.run_profiler_thread, args=(filepath,), daemon=True).start()
 
     def run_profiler_thread(self, filepath):
-        profiler_exe = "libass_profiler.exe"
-        output_csv = "output.csv"
-        exe_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), profiler_exe)
-        if not os.path.exists(exe_path): exe_path = os.path.abspath(profiler_exe)
+        # Content-based hashing
+        try:
+            hasher = hashlib.md5()
+            with open(filepath, 'rb') as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    hasher.update(chunk)
+            file_hash = hasher.hexdigest()
+        except Exception as e:
+            GLib.idle_add(self.show_error, f"Failed to hash file: {e}")
+            GLib.idle_add(self.reset_ui)
+            return
+
+        cache_file = os.path.join(CACHE_DIR, f"{file_hash}.csv")
+        
+        needs_profile = not os.path.exists(cache_file)
+        if not needs_profile:
+            print(f"Using cached results: {cache_file}")
 
         try:
-            abs_filepath = os.path.abspath(filepath)
-            wp = subprocess.run(['winepath', '-w', abs_filepath], capture_output=True, text=True, timeout=5)
-            win_filepath = wp.stdout.strip() if wp.returncode == 0 else abs_filepath
+            if needs_profile:
+                profiler_exe = "libass_profiler.exe"
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                exe_path = os.path.join(script_dir, profiler_exe)
+                if not os.path.exists(exe_path): exe_path = os.path.abspath(profiler_exe)
+                if not os.path.exists(exe_path): raise Exception(f"Profiler not found: {profiler_exe}")
 
-            abs_out = os.path.abspath(output_csv)
-            wp_out = subprocess.run(['winepath', '-w', abs_out], capture_output=True, text=True, timeout=5)
-            win_out = wp_out.stdout.strip() if wp_out.returncode == 0 else output_csv
+                # Use a dedicated temp directory for this run to avoid collisions
+                import tempfile, shutil
+                with tempfile.TemporaryDirectory(dir=os.getcwd(), prefix="prof_") as tmpdir:
+                    # 1. Prepare input
+                    abs_filepath = os.path.abspath(filepath)
+                    tmp_ass = os.path.join(tmpdir, "input.ass")
+                    shutil.copy(abs_filepath, tmp_ass)
+                    
+                    # 2. Prepare paths for Wine
+                    wp = subprocess.run(['winepath', '-w', tmp_ass], capture_output=True, text=True)
+                    win_filepath = wp.stdout.strip().splitlines()[-1]
+                    
+                    GLib.idle_add(self.update_ui, 0.4, "Executing Wine...")
+                    
+                    # 3. Run Wine with NO output argument (it will write to 'output.csv' in tmpdir)
+                    # We must run it with cwd=tmpdir
+                    cmd = ['wine', exe_path, win_filepath]
+                    print(f"Executing: {shlex.join(cmd)} in {tmpdir}")
+                    
+                    proc = subprocess.run(cmd, cwd=tmpdir, capture_output=True, text=True)
+                    
+                    if proc.returncode != 0:
+                        raise Exception(f"Profiler failed (code {proc.returncode}):\n{proc.stderr}")
+                    
+                    generated_out = os.path.join(tmpdir, "output.csv")
+                    if not os.path.exists(generated_out):
+                        # Try to see if it wrote to a different default name or if we need to list dir
+                        files = os.listdir(tmpdir)
+                        raise Exception(f"Wine reported success, but 'output.csv' was not created.\nFiles in tmpdir: {files}\nStdout: {proc.stdout}")
 
-            GLib.idle_add(self.update_ui, 0.4, "Executing Wine...")
-            subprocess.run(['wine', exe_path, win_filepath, win_out], capture_output=True)
+                    # 4. Move to cache
+                    os.replace(generated_out, cache_file)
 
             GLib.idle_add(self.update_ui, 0.8, "Loading Data...")
-            data_list, title = self.load_csv(abs_out)
-            
+            data_list, title = self.load_csv(cache_file)
             GLib.idle_add(self.show_results, data_list, title)
         except Exception as e:
             GLib.idle_add(self.show_error, str(e))
@@ -401,18 +407,24 @@ class AssProfilerWindow(Gtk.ApplicationWindow):
         data_list = []
         with open(csv_file, newline='') as f:
             reader = csv.reader(f)
-            title = next(reader)[0]
-            next(reader)
+            try:
+                line = next(reader)
+                title = line[0] if line else "Untitled"
+                next(reader)
+            except StopIteration:
+                raise Exception("CSV is empty.")
+            
             for row in reader:
                 if len(row) < 5: continue
                 data_list.append(Frame_Statistics(*row))
+        if not data_list: raise Exception("No data points.")
         return data_list, title
 
     def show_error(self, msg):
         dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text="Error")
         dialog.props.secondary_text = msg
         dialog.connect("response", lambda d, r: d.destroy())
-        dialog.show()
+        dialog.present()
         return False
 
     def reset_ui(self):
