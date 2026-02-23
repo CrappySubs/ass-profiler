@@ -78,12 +78,14 @@ class ProfilerGraph(Gtk.DrawingArea):
         # View State
         if data_points:
             self.min_x = 0
-            self.max_x = max(p[0] for p in data_points)
+            self.abs_max_x = max(p[0] for p in data_points)
+            self.max_x = self.abs_max_x
             self.min_y = 0
             raw_max_y = max(p[1] for p in data_points) if data_points else 1
             self.max_y = 60 if y_label_type == 'ms' else raw_max_y * 1.2
         else:
             self.min_x, self.max_x, self.min_y, self.max_y = 0, 100, 0, 100
+            self.abs_max_x = 100
 
         self.set_draw_func(self.on_draw)
         
@@ -129,8 +131,9 @@ class ProfilerGraph(Gtk.DrawingArea):
 
         # Clamp view range
         self.min_x = max(0, self.min_x)
+        self.max_x = min(self.abs_max_x, self.max_x)
         self.min_y = max(0, self.min_y)
-        if self.max_x <= self.min_x: self.max_x = self.min_x + 1
+        if self.max_x <= self.min_x: self.max_x = self.min_x + 0.001
         if self.max_y <= self.min_y: self.max_y = self.min_y + 1
 
         def to_screen(x, y):
@@ -215,10 +218,18 @@ class ProfilerGraph(Gtk.DrawingArea):
         range_x = self.max_x - self.min_x
         if state & Gdk.ModifierType.CONTROL_MASK:
             scale = zoom_factor if dy > 0 else (1/zoom_factor)
-            new_range = range_x * scale
+            new_range = min(self.abs_max_x, range_x * scale)
             mid_x = (self.min_x + self.max_x) / 2
-            self.min_x = max(0, mid_x - new_range / 2)
-            self.max_x = self.min_x + new_range
+            
+            self.min_x = mid_x - new_range / 2
+            self.max_x = mid_x + new_range / 2
+            
+            if self.min_x < 0:
+                self.max_x -= self.min_x
+                self.min_x = 0
+            if self.max_x > self.abs_max_x:
+                self.min_x = max(0, self.min_x - (self.max_x - self.abs_max_x))
+                self.max_x = self.abs_max_x
         elif state & Gdk.ModifierType.SHIFT_MASK:
             # Zoom Y: Lock bottom at 0
             scale = zoom_factor if dy > 0 else (1/zoom_factor)
@@ -227,7 +238,7 @@ class ProfilerGraph(Gtk.DrawingArea):
         else:
             # Pan X
             shift = range_x * 0.1 * (1 if dy > 0 else -1)
-            self.min_x = max(0, self.min_x + shift)
+            self.min_x = max(0, min(self.abs_max_x - range_x, self.min_x + shift))
             self.max_x = self.min_x + range_x
         self.queue_draw()
 
@@ -242,8 +253,17 @@ class ProfilerGraph(Gtk.DrawingArea):
         height = self.get_height() - 90
         if width <= 0 or height <= 0: return
         rx, ry = self.drag_start_max_x - self.drag_start_min_x, self.drag_start_max_y - self.drag_start_min_y
-        self.min_x = max(0, self.drag_start_min_x - (offset_x / width) * rx)
+        
+        self.min_x = self.drag_start_min_x - (offset_x / width) * rx
         self.max_x = self.min_x + rx
+        
+        if self.min_x < 0:
+            self.min_x = 0
+            self.max_x = rx
+        elif self.max_x > self.abs_max_x:
+            self.max_x = self.abs_max_x
+            self.min_x = max(0, self.max_x - rx)
+
         self.min_y = max(0, self.drag_start_min_y + (offset_y / height) * ry)
         self.max_y = self.min_y + ry
         self.queue_draw()
